@@ -650,3 +650,101 @@ impl Watchable<()> for State {
         tokio_stream::wrappers::WatchStream::new(self.tip.watch().clone())
     }
 }
+
+#[cfg(test)]
+mod bug_auth_prefix_bypass {
+    // authorization prefix / cardinality bypass.
+    //
+    // verify_authorized_transaction builds one signing message per provided
+    // authorization and batch-verifies only those. It never asserts that the
+    // number of authorizations equals the number of tx inputs. The ownership
+    // check in validate_transaction (above) has the same shape: it zips
+    // authorizations with spent_utxos, so any input past the shorter list is
+    // never checked.
+    //
+    // This test drives the REAL verifier with a 2-input tx (attacker utxo +
+    // victim utxo) carrying only the attacker's single signature, and shows it
+    // passes even though the victim input has no authorization.
+
+    use crate::{
+        authorization::{
+            Authorization, SigningKey, get_address, sign_tx,
+            verify_authorized_transaction,
+        },
+        types::{
+            AuthorizedTransaction, GetAddress, OutPoint, Transaction, Txid,
+        },
+    };
+
+    fn outpoint(byte: u8) -> OutPoint {
+        OutPoint::Regular {
+            txid: Txid([byte; 32]),
+            vout: 0,
+        }
+    }
+
+    #[test]
+    fn auth_prefix_cardinality_bypass() {
+        // deterministic keys so the test is reproducible
+        let attacker = SigningKey::from_bytes(&[1u8; 32]);
+        let victim = SigningKey::from_bytes(&[2u8; 32]);
+
+        let attacker_addr = get_address(&attacker.verifying_key().into());
+        let victim_addr = get_address(&victim.verifying_key().into());
+        assert_ne!(attacker_addr, victim_addr);
+
+        // 2 inputs: attacker's utxo first, victim's utxo second.
+        let tx = Transaction::new(vec![outpoint(0xaa), outpoint(0xbb)], vec![]);
+
+        // Only ONE authorization, signed by the attacker over the whole tx.
+        // The victim never signs anything.
+        let attacker_auth = Authorization {
+            verifying_key: attacker.verifying_key().into(),
+            signature: sign_tx(&attacker, &tx).unwrap(),
+        };
+        let authed = AuthorizedTransaction {
+            transaction: tx.clone(),
+            authorizations: vec![attacker_auth.clone()],
+        };
+
+        // cardinality mismatch: 2 inputs, 1 authorization.
+        assert_eq!(authed.transaction.inputs.len(), 2);
+        assert_eq!(authed.authorizations.len(), 1);
+
+        // the only provided auth is the attacker's; the victim's address does
+        // not appear anywhere in the authorization list.
+        assert_eq!(authed.authorizations[0].get_address(), attacker_addr);
+        assert!(
+            !authed
+                .authorizations
+                .iter()
+                .any(|a| a.get_address() == victim_addr),
+            "victim input is supposed to be unauthorized"
+        );
+
+        // REAL signature verifier accepts the under-authorized transaction.
+        let res = verify_authorized_transaction(&authed);
+        assert!(
+            res.is_ok(),
+            "verify_authorized_transaction must accept the under-authorized tx \
+             to prove the bug, got: {res:?}"
+        );
+
+        // sanity: the same verifier still rejects a tampered/forged signature,
+        // so the pass above is a real verification, not a no-op.
+        let mut forged = authed.clone();
+        let other = SigningKey::from_bytes(&[3u8; 32]);
+        forged.authorizations[0].signature = sign_tx(&other, &tx).unwrap();
+        assert!(
+            verify_authorized_transaction(&forged).is_err(),
+            "verifier should reject a signature that does not match the key"
+        );
+
+        println!(
+            "2-input tx (inputs[1] = victim {victim_addr}) with \
+             1 attacker authorization ({attacker_addr}) passes \
+             verify_authorized_transaction; victim input is never \
+             authorization-checked yet would be consumed."
+        );
+    }
+}
